@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Default capability for all app windows (core events + invoke)",
+  "windows": ["*"],
+  "permissions": ["core:default"]
+}
