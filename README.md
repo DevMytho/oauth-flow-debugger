@@ -12,13 +12,6 @@ Debugging OAuth is miserable. You're decoding base64 in your browser console, ch
 
 `oauth-flow-debugger` gives you a visual, step-by-step breakdown of any OAuth 2.0 or OIDC flow — in real time, on your machine, with no proxies needed.
 
----
-
-## Screenshots
-
-> _coming soon_
-
----
 
 ## What it does
 
