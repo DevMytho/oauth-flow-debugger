@@ -6,6 +6,24 @@ body,
   height: 100%;
 }
 
+/* The native WebView renders form controls with the OS light theme by
+   default, which can paint inputs/selects white and make their text
+   invisible. Force dark controls everywhere so explicit text colors
+   (zinc-100/200) are always visible. */
+html,
+input,
+select,
+textarea,
+button {
+  color-scheme: dark;
+}
+
+/* Dropdown option lists ignore color-scheme in some WebKit builds. */
+select option {
+  background-color: #18181b;
+  color: #e4e4e7;
+}
+
 body {
   background-color: #09090b;
   color: #e4e4e7;

@@ -1,0 +1,99 @@
+name: Release
+
+# Push a tag like `v0.2.0` (must match the version in
+# src-tauri/tauri.conf.json) to build all platform bundles and open a
+# draft GitHub release with the installers attached.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            platform: macos-latest
+            args: --target aarch64-apple-darwin
+          - name: macos-x64
+            platform: macos-latest
+            args: --target x86_64-apple-darwin
+          - name: linux-x64
+            platform: ubuntu-22.04
+            args: ""
+          - name: windows-x64
+            platform: windows-latest
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify tag matches app version
+        shell: bash
+        run: |
+          version=$(node -e "console.log(JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json','utf8')).version)")
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match app version v${version} (src-tauri/tauri.conf.json). Bump the version first."
+            exit 1
+          fi
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Typecheck frontend
+        run: npm run typecheck
+
+      - name: Run backend tests
+        shell: bash
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build bundles and create draft release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Ad-hoc signature so Gatekeeper doesn't report the macOS build
+          # as damaged. Replace with real Apple signing + notarization
+          # secrets when certificates are available.
+          APPLE_SIGNING_IDENTITY: "-"
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: oauth-flow-debugger ${{ github.ref_name }}
+          releaseBody: >
+            Download the installer for your platform:
+            `.dmg` (macOS, Apple Silicon) · `_x64.dmg` (macOS, Intel) ·
+            `.exe` / `.msi` (Windows) · `.AppImage` / `.deb` / `.rpm` (Linux).
+            macOS builds are ad-hoc signed — on first launch, right-click the
+            app and choose Open.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
