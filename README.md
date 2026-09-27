@@ -151,17 +151,6 @@ Signature
 
 **Frontend:** React 18, TypeScript, Vite, Tailwind CSS
 
----
-
-## Roadmap
-
-- [ ] Token refresh flow visualization
-- [ ] JWKS endpoint fetcher + offline key verification
-- [ ] Built-in test providers (GitHub, Google, Auth0, Supabase)
-- [ ] Export full flow transcript as a pentest evidence artifact
-- [ ] Detect common misconfigs automatically (missing PKCE, implicit flow, weak state)
-
----
 
 ## ⚠️ Disclaimer
 
