@@ -9,13 +9,25 @@
 //!   * `pkce`            — RFC 7636 verifier/challenge + state/nonce randomness
 //!   * `token_exchange`  — token endpoint POSTs (auth code, client credentials)
 //!   * `decode`          — JWT header/payload decoding (no signature verify)
+//!   * `jwks`            — JWKS fetch + RS256/ES256 signature verification
+//!   * `findings`        — automated security checks with severity ratings
+//!   * `export`          — Markdown/JSON report export (tokens redacted)
+//!   * `store`           — in-memory transcript/finding store (never on disk)
 
 mod decode;
+mod device_flow;
+mod export;
+mod findings;
+mod jwks;
 mod listener;
+#[cfg(test)]
+mod mock_oidc_tests;
 mod pkce;
+mod store;
 mod token_exchange;
 
 use decode::DecodedJwt;
+use findings::{Expectations, Finding, Summary};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -36,6 +48,7 @@ pub enum FlowType {
     AuthorizationCode,
     Implicit,
     ClientCredentials,
+    DeviceAuthorization,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +72,26 @@ pub struct FlowConfig {
     pub pkce: bool,
     pub include_nonce: bool,
     pub client_auth: ClientAuth,
+    /// Preferred loopback port for the redirect listener (0 = 9004). Ignored
+    /// when `redirect_uri` is set — that port is fixed by provider
+    /// registration, so a conflict there is reported as an error instead.
+    #[serde(default)]
+    pub listener_port: u16,
+    /// Explicit JWKS endpoint for signature verification. When empty, the
+    /// backend falls back to OIDC discovery from `expected_iss` (and then the
+    /// token's own `iss` claim).
+    #[serde(default)]
+    pub jwks_uri: String,
+    /// Optional expected issuer for `iss` checks (trailing slash ignored).
+    #[serde(default)]
+    pub expected_iss: String,
+    /// Optional expected JWT alg (e.g. `RS256`) — enables the
+    /// "HS256 where RS256 was expected" check.
+    #[serde(default)]
+    pub expected_alg: String,
+    /// Device Authorization Grant (RFC 8628) endpoint.
+    #[serde(default)]
+    pub device_authorization_endpoint: String,
 }
 
 /// Secret per-attempt flow state kept in the backend between launch and
@@ -88,6 +121,7 @@ pub struct FlowStart {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepKind {
+    Info,
     AuthUrl,
     Callback,
     TokenRequest,
@@ -103,6 +137,17 @@ pub enum StepStatus {
     Ok,
     Warn,
     Error,
+}
+
+impl StepStatus {
+    pub fn icon(&self) -> &'static str {
+        match self {
+            StepStatus::Info => "ℹ️",
+            StepStatus::Ok => "✅",
+            StepStatus::Warn => "⚠️",
+            StepStatus::Error => "❌",
+        }
+    }
 }
 
 /// One entry in the frontend timeline, emitted on the `flow-step` event.
@@ -131,11 +176,15 @@ pub struct TokenBundle {
     pub decoded_id: Option<DecodedJwt>,
     /// epoch seconds, derived from `expires_in`
     pub expires_at: Option<i64>,
+    /// JWKS signature verification results (per token, if they are JWTs).
+    pub verification: jwks::BundleVerification,
 }
 
 #[derive(Default)]
 pub struct AppState {
     pub pending: Arc<Mutex<Option<PendingFlow>>>,
+    /// In-flight Device Authorization flow (device_code stays backend-side).
+    pub device: device_flow::SharedDeviceFlow,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +212,53 @@ pub fn emit_step<R: tauri::Runtime>(
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
     };
+    // Keep an in-memory transcript for the report export (redacted on export).
+    store::record_step(&step);
     let _ = app.emit("flow-step", &step);
+}
+
+/// Payload behind the `findings-updated` event.
+#[derive(Debug, Clone, Serialize)]
+pub struct FindingsReport {
+    pub findings: Vec<Finding>,
+    pub summary: Summary,
+}
+
+/// Push the current findings (and summary) to the frontend.
+pub fn emit_findings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let _ = app.emit(
+        "findings-updated",
+        FindingsReport {
+            findings: store::findings(),
+            summary: store::summary(),
+        },
+    );
+}
+
+/// Navigation policy for the controlled auth window: only the provider's
+/// authorization host (and its parent / sub-domain relatives, so a login
+/// redirect like `accounts.google.com` → `google.com` keeps working) plus the
+/// loopback redirect may load. Anything else is refused before it renders.
+pub fn navigation_allowed(target: &url::Url, auth_host: &str) -> bool {
+    let Some(host) = target.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    match target.scheme() {
+        "https" => {}
+        "http" if is_loopback(&host) => return true,
+        _ => return false,
+    }
+    if auth_host.is_empty() {
+        return false;
+    }
+    host == auth_host
+        || host.ends_with(&format!(".{auth_host}"))
+        || auth_host.ends_with(&format!(".{host}"))
+}
+
+pub(crate) fn is_loopback(host: &str) -> bool {
+    host == "localhost" || host.ends_with(".localhost") || host == "127.0.0.1" || host == "[::1]"
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +267,9 @@ pub fn emit_step<R: tauri::Runtime>(
 
 /// Process an intercepted callback: validate `state`, capture the code (auth
 /// code flow) or decode tokens straight from the fragment (implicit flow).
-pub fn process_callback<R: tauri::Runtime>(
+/// Async because implicit-flow tokens are verified against the JWKS before
+/// the result is handed to the UI.
+pub async fn process_callback<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     pending_store: &Arc<Mutex<Option<PendingFlow>>>,
     params: HashMap<String, String>,
@@ -194,8 +291,7 @@ pub fn process_callback<R: tauri::Runtime>(
 
     let has_code = params.contains_key("code");
     let has_error = params.contains_key("error");
-    let has_tokens =
-        params.contains_key("access_token") || params.contains_key("id_token");
+    let has_tokens = params.contains_key("access_token") || params.contains_key("id_token");
     let pkce = pending
         .as_ref()
         .map(|p| p.code_verifier.is_some())
@@ -241,6 +337,14 @@ pub fn process_callback<R: tauri::Runtime>(
         }),
     );
 
+    // Automated checks for this callback (state present / matching).
+    store::record_findings(&findings::callback_findings(
+        &params,
+        state_valid,
+        expected_state.is_some(),
+    ));
+    emit_findings(app);
+
     if has_error {
         schedule_auth_window_close(app, 2500);
         return;
@@ -260,7 +364,39 @@ pub fn process_callback<R: tauri::Runtime>(
         return;
     }
     if has_tokens {
-        token_exchange::bundle_from_params(app, &params);
+        // Implicit flow: validate nonce/aud/iss against what we sent, and
+        // verify token signatures against the JWKS.
+        let expectations = Expectations {
+            client_id: pending
+                .as_ref()
+                .map(|p| p.config.client_id.clone())
+                .unwrap_or_default(),
+            expected_iss: pending
+                .as_ref()
+                .map(|p| p.config.expected_iss.clone())
+                .unwrap_or_default(),
+            expected_alg: pending
+                .as_ref()
+                .map(|p| p.config.expected_alg.clone())
+                .unwrap_or_default(),
+            nonce: nonce_expected.clone(),
+            requested_scope: pending
+                .as_ref()
+                .map(|p| p.config.scope.clone())
+                .unwrap_or_default(),
+        };
+        let verification = match pending.as_ref() {
+            Some(p) => {
+                jwks::verify_tokens(
+                    &p.config,
+                    params.get("access_token").map(String::as_str),
+                    params.get("id_token").map(String::as_str),
+                )
+                .await
+            }
+            None => jwks::BundleVerification::default(),
+        };
+        token_exchange::bundle_from_params(app, &params, expectations, verification);
         schedule_auth_window_close(app, 2500);
     }
 }
@@ -283,6 +419,61 @@ fn schedule_auth_window_close<R: tauri::Runtime>(app: &tauri::AppHandle<R>, dela
 // Commands
 // ---------------------------------------------------------------------------
 
+/// Build the authorization URL exactly the way the app does in production —
+/// shared with the mock-OIDC integration tests so they exercise the real
+/// request shape (response_type, PKCE, nonce, state).
+///
+/// Returns the URL and the `response_type` used.
+pub fn build_auth_url(
+    config: &FlowConfig,
+    redirect_uri: &str,
+    state: &str,
+    nonce: Option<&str>,
+    code_challenge: Option<&str>,
+) -> Result<(url::Url, &'static str), String> {
+    let mut auth_url = url::Url::parse(config.authorization_endpoint.trim())
+        .map_err(|e| format!("invalid authorization endpoint: {e}"))?;
+    if auth_url.scheme() != "http" && auth_url.scheme() != "https" {
+        return Err("authorization endpoint must be an http(s) URL".into());
+    }
+    // Remote authorization endpoints must be HTTPS (plain http is accepted for
+    // loopback mock providers only).
+    if auth_url.scheme() == "http" {
+        let host = auth_url.host_str().unwrap_or_default().to_ascii_lowercase();
+        if !is_loopback(&host) {
+            return Err(format!(
+                "authorization endpoint must be https — refusing plain http for `{host}`"
+            ));
+        }
+    }
+
+    let response_type = match config.flow_type {
+        FlowType::Implicit if nonce.is_some() => "id_token token",
+        FlowType::Implicit => "token",
+        _ => "code",
+    };
+
+    {
+        let mut q = auth_url.query_pairs_mut();
+        q.append_pair("response_type", response_type);
+        q.append_pair("client_id", config.client_id.trim());
+        q.append_pair("redirect_uri", redirect_uri);
+        let scope = config.scope.trim();
+        if !scope.is_empty() {
+            q.append_pair("scope", scope);
+        }
+        q.append_pair("state", state);
+        if let Some(n) = nonce {
+            q.append_pair("nonce", n);
+        }
+        if let Some(c) = code_challenge {
+            q.append_pair("code_challenge", c);
+            q.append_pair("code_challenge_method", "S256");
+        }
+    }
+    Ok((auth_url, response_type))
+}
+
 /// Launch a browser-based flow (authorization code or implicit):
 /// arms the redirect listener, stores pending state, builds the authorization
 /// URL, and opens it in a controlled webview.
@@ -297,6 +488,9 @@ async fn start_flow(
             "Client Credentials does not use a browser — call client_credentials_flow".into(),
         );
     }
+    if config.flow_type == FlowType::DeviceAuthorization {
+        return Err("Device Authorization does not use a browser — call start_device_flow".into());
+    }
     let auth_endpoint = config.authorization_endpoint.trim();
     if auth_endpoint.is_empty() {
         return Err("authorization endpoint is required".into());
@@ -304,19 +498,52 @@ async fn start_flow(
     if config.client_id.trim().is_empty() {
         return Err("client_id is required".into());
     }
-    let mut auth_url =
-        url::Url::parse(auth_endpoint).map_err(|e| format!("invalid authorization endpoint: {e}"))?;
-    if auth_url.scheme() != "http" && auth_url.scheme() != "https" {
-        return Err("authorization endpoint must be an http(s) URL".into());
-    }
 
-    let redirect_uri = {
-        let r = config.redirect_uri.trim();
-        if r.is_empty() {
-            listener::redirect_uri()
-        } else {
-            r.to_string()
+    // Fresh run: drop the previous transcript/findings, record this config and
+    // run the config-time checks (HTTPS, implicit flow, PKCE, nonce).
+    store::reset();
+    store::set_config(&config);
+    store::record_findings(&findings::config_findings(&config));
+
+    // Where does the redirect listener bind? An explicit redirect_uri pins the
+    // port (the provider has that exact URI registered), so a conflict there is
+    // an error; otherwise we generate the URI from whatever port we get.
+    let explicit_redirect = config.redirect_uri.trim().to_string();
+    let (preferred_port, allow_fallback) = if explicit_redirect.is_empty() {
+        (
+            if config.listener_port == 0 {
+                listener::DEFAULT_PORT
+            } else {
+                config.listener_port
+            },
+            true,
+        )
+    } else {
+        match url::Url::parse(&explicit_redirect) {
+            Ok(u) if u.port().is_some() => (u.port().unwrap(), false),
+            Ok(_) => {
+                return Err("redirect_uri must include an explicit port (e.g. \
+                     http://localhost:9004/callback)"
+                    .into())
+            }
+            Err(e) => return Err(format!("invalid redirect_uri: {e}")),
         }
+    };
+
+    // Bind the redirect listener before anything can redirect to it.
+    listener::ensure_started(
+        app.clone(),
+        state.pending.clone(),
+        preferred_port,
+        allow_fallback,
+    )
+    .await?;
+    emit_findings(&app);
+
+    let redirect_uri = if explicit_redirect.is_empty() {
+        listener::redirect_uri()
+    } else {
+        explicit_redirect
     };
 
     let use_pkce = config.pkce && config.flow_type == FlowType::AuthorizationCode;
@@ -333,30 +560,14 @@ async fn start_flow(
     } else {
         (None, None)
     };
-    let response_type = match config.flow_type {
-        FlowType::Implicit if nonce.is_some() => "id_token token",
-        FlowType::Implicit => "token",
-        _ => "code",
-    };
 
-    {
-        let mut q = auth_url.query_pairs_mut();
-        q.append_pair("response_type", response_type);
-        q.append_pair("client_id", config.client_id.trim());
-        q.append_pair("redirect_uri", &redirect_uri);
-        let scope = config.scope.trim();
-        if !scope.is_empty() {
-            q.append_pair("scope", scope);
-        }
-        q.append_pair("state", &state_val);
-        if let Some(n) = &nonce {
-            q.append_pair("nonce", n);
-        }
-        if let Some(c) = &challenge {
-            q.append_pair("code_challenge", c);
-            q.append_pair("code_challenge_method", "S256");
-        }
-    }
+    let (auth_url, response_type) = build_auth_url(
+        &config,
+        &redirect_uri,
+        &state_val,
+        nonce.as_deref(),
+        challenge.as_deref(),
+    )?;
     let auth_url_str = auth_url.to_string();
 
     let pending = PendingFlow {
@@ -372,31 +583,46 @@ async fn start_flow(
         .lock()
         .map_err(|_| "internal state lock poisoned".to_string())? = Some(pending);
 
-    // Bind the redirect listener before anything can redirect to it.
-    listener::ensure_started(app.clone(), state.pending.clone()).await?;
-
-    // Controlled webview: reuse if already open, otherwise create.
+    // Controlled webview with a navigation allowlist. The window is recreated
+    // on every start so a remote provider page can never keep a stale (or no)
+    // policy, and it can never navigate somewhere we did not intend.
     let web_url: url::Url = auth_url_str
         .parse()
         .map_err(|e| format!("failed to parse authorization url: {e}"))?;
-    match app.get_webview_window(AUTH_WINDOW_LABEL) {
-        Some(win) => {
-            win.navigate(web_url)
-                .map_err(|e| format!("failed to load authorization url: {e}"))?;
-            let _ = win.set_focus();
-        }
-        None => {
-            tauri::WebviewWindowBuilder::new(
-                &app,
-                AUTH_WINDOW_LABEL,
-                tauri::WebviewUrl::External(web_url),
-            )
-            .title("Authenticate — OAuth Flow Debugger")
-            .inner_size(960.0, 760.0)
-            .center()
-            .build()
-            .map_err(|e| format!("failed to open auth window: {e}"))?;
-        }
+    let allowed_host = web_url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if let Some(win) = app.get_webview_window(AUTH_WINDOW_LABEL) {
+        let _ = win.close();
+    }
+    {
+        let nav_app = app.clone();
+        let nav_host = allowed_host.clone();
+        tauri::WebviewWindowBuilder::new(
+            &app,
+            AUTH_WINDOW_LABEL,
+            tauri::WebviewUrl::External(web_url),
+        )
+        .title("Authenticate — OAuth Flow Debugger")
+        .inner_size(960.0, 760.0)
+        .center()
+        .on_navigation(move |target| {
+            let allowed = navigation_allowed(target, &nav_host);
+            if !allowed {
+                emit_step(
+                    &nav_app,
+                    StepKind::Error,
+                    "Blocked navigation from the auth window",
+                    StepStatus::Warn,
+                    json!({
+                        "url": target.to_string(),
+                        "allowed_host": nav_host,
+                        "reason": "outside the configured authorization host",
+                    }),
+                );
+            }
+            allowed
+        })
+        .build()
+        .map_err(|e| format!("failed to open auth window: {e}"))?;
     }
 
     emit_step(
@@ -424,7 +650,7 @@ async fn start_flow(
         nonce,
         code_verifier: verifier,
         code_challenge: challenge,
-        listener_port: listener::LISTENER_PORT,
+        listener_port: listener::active_port().unwrap_or(listener::DEFAULT_PORT),
     })
 }
 
@@ -483,6 +709,27 @@ async fn client_credentials_flow(
     }
 }
 
+/// Device Authorization Grant (RFC 8628): request a device code + user code.
+/// The device code stays in the backend; only the user-facing parts return.
+#[tauri::command]
+async fn start_device_flow(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    config: FlowConfig,
+) -> Result<device_flow::DeviceAuthStart, String> {
+    device_flow::start(&app, &state.device, config).await
+}
+
+/// Poll the token endpoint for the Device Authorization grant until the user
+/// approves (or the code is rejected / expires).
+#[tauri::command]
+async fn poll_device_token(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<TokenBundle, String> {
+    device_flow::poll(&app, &state.device).await
+}
+
 /// Close the controlled auth webview (manual user action in the UI).
 #[tauri::command]
 fn close_auth_window(app: tauri::AppHandle) {
@@ -491,14 +738,42 @@ fn close_auth_window(app: tauri::AppHandle) {
     }
 }
 
-/// Clear pending flow state (start of a new attempt / Reset button).
+/// Clear pending flow state (start of a new attempt / Reset button), the
+/// in-memory transcript/findings, and release the redirect listener.
 #[tauri::command]
-fn reset_flow(state: tauri::State<'_, AppState>) -> Result<(), String> {
+fn reset_flow(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     *state
         .pending
         .lock()
         .map_err(|_| "internal state lock poisoned".to_string())? = None;
+    if let Ok(mut guard) = state.device.lock() {
+        *guard = None;
+    }
+    listener::shutdown();
+    store::reset();
+    emit_findings(&app);
     Ok(())
+}
+
+/// Current findings + severity summary for the UI panel.
+#[tauri::command]
+fn get_findings() -> FindingsReport {
+    FindingsReport {
+        findings: store::findings(),
+        summary: store::summary(),
+    }
+}
+
+/// Export the flow transcript as Markdown or JSON with tokens redacted.
+#[tauri::command]
+fn export_flow(format: String) -> Result<String, String> {
+    match format.as_str() {
+        "json" => Ok(export::to_json()),
+        "markdown" | "md" => Ok(export::to_markdown()),
+        other => Err(format!(
+            "unknown export format `{other}` (use json or markdown)"
+        )),
+    }
 }
 
 fn main() {
@@ -508,8 +783,12 @@ fn main() {
             start_flow,
             exchange_code,
             client_credentials_flow,
+            start_device_flow,
+            poll_device_token,
             close_auth_window,
-            reset_flow
+            reset_flow,
+            get_findings,
+            export_flow
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -524,11 +803,16 @@ fn main() {
 mod e2e_tests {
     use super::*;
 
-    /// Same known-good RS256 token as the decode tests.
-    const ID_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwiaXNzIjoiaHR0cHM6Ly9hY2NvdW50cy5leGFtcGxlIiwiYXVkIjoiY2xpZW50LTEyMyIsImV4cCI6MTk5OTk5OTk5OSwiaWF0IjoxOTAwMDAwMDAwLCJub25jZSI6ImFiYzEyMyJ9.signature";
+    /// RS256-shaped token whose `iss` points at a dead loopback port: the
+    /// signature-verification step attempts OIDC discovery against it, gets
+    /// an instant connection refused, and records `sig_unverified` — all
+    /// without touching the real network.
+    const ID_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwiaXNzIjoiaHR0cDovLzEyNy4wLjAuMTo5IiwiYXVkIjoiY2xpZW50LTEyMyIsImV4cCI6MTk5OTk5OTk5OSwiaWF0IjoxOTAwMDAwMDAwLCJub25jZSI6ImFiYzEyMyJ9.signature";
 
     #[tokio::test]
     async fn callback_capture_state_check_and_token_exchange() {
+        // Shares global listener + store state with the other tests.
+        let _guard = listener::serial_lock().await;
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
 
@@ -560,48 +844,65 @@ mod e2e_tests {
         });
 
         // ---- pending flow exactly as start_flow would create it ----
+        // The port is chosen up front so the registered redirect_uri and the
+        // listener agree; allow_fallback=false mirrors an explicit redirect_uri.
+        const FLOW_PORT: u16 = 9014;
+        let redirect_uri = listener::redirect_uri_for(FLOW_PORT);
         let config = FlowConfig {
             flow_type: FlowType::AuthorizationCode,
             authorization_endpoint: "https://provider.example/authorize".into(),
             token_endpoint: format!("http://127.0.0.1:{token_port}/token"),
-            client_id: "demo-client".into(),
+            client_id: "client-123".into(),
             client_secret: String::new(),
-            redirect_uri: listener::redirect_uri(),
+            redirect_uri: redirect_uri.clone(),
             scope: "openid profile email".into(),
             pkce: true,
             include_nonce: true,
             client_auth: ClientAuth::None,
+            listener_port: FLOW_PORT,
+            expected_iss: String::new(),
+            expected_alg: "RS256".into(),
+            jwks_uri: String::new(),
+            device_authorization_endpoint: String::new(),
         };
         let verifier = pkce::generate_verifier();
+        // The mock id_token carries nonce=abc123 — the value a real flow would
+        // have sent.
         let store: Arc<Mutex<Option<PendingFlow>>> = Arc::new(Mutex::new(Some(PendingFlow {
             config,
             state: "state-good".into(),
-            nonce: Some(pkce::generate_nonce()),
+            nonce: Some("abc123".into()),
             code_verifier: Some(verifier.clone()),
-            redirect_uri: listener::redirect_uri(),
+            redirect_uri: redirect_uri.clone(),
             code: None,
         })));
 
-        // ---- arm the real listener on :9004 ----
-        listener::ensure_started(handle.clone(), store.clone())
+        // ---- arm the real listener (127.0.0.1 only, one-shot) ----
+        listener::ensure_started(handle.clone(), store.clone(), FLOW_PORT, false)
             .await
             .unwrap();
+        assert!(listener::active_port().is_some());
 
         let http = reqwest::Client::new();
 
-        // 1. Provider redirects back with a matching state → code captured.
-        let url = format!(
-            "http://127.0.0.1:{}/callback?code=auth-code-1&state=state-good",
-            listener::LISTENER_PORT
-        );
+        // 1. Provider redirects back with a matching state → code captured,
+        //    and the one-shot listener releases the port.
+        let url =
+            format!("http://127.0.0.1:{FLOW_PORT}/callback?code=auth-code-1&state=state-good");
         let resp = http.get(&url).send().await.unwrap();
         assert!(resp.status().is_success());
         assert_eq!(
             store.lock().unwrap().as_ref().unwrap().code.as_deref(),
             Some("auth-code-1")
         );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            listener::active_port().is_none(),
+            "listener must be one-shot"
+        );
 
-        // 2. Mismatched state → callback rejected, no code stored.
+        // 2. Mismatched state → callback rejected, no code stored. The listener
+        //    is re-armed first, exactly as a second flow attempt would.
         {
             let mut guard = store.lock().unwrap();
             let mut pending = guard.clone().unwrap();
@@ -609,13 +910,17 @@ mod e2e_tests {
             pending.code = None;
             *guard = Some(pending);
         }
-        let url = format!(
-            "http://127.0.0.1:{}/callback?code=injected-code&state=WRONG",
-            listener::LISTENER_PORT
-        );
+        listener::ensure_started(handle.clone(), store.clone(), FLOW_PORT, false)
+            .await
+            .unwrap();
+        let url = format!("http://127.0.0.1:{FLOW_PORT}/callback?code=injected-code&state=WRONG");
         let resp = http.get(&url).send().await.unwrap();
         assert!(resp.status().is_success());
         assert!(store.lock().unwrap().as_ref().unwrap().code.is_none());
+        assert!(
+            store::findings().iter().any(|f| f.id == "state_mismatch"),
+            "the mismatched state must raise a critical finding"
+        );
 
         // 3. Exchange the captured code against the mock token endpoint.
         let pending = store.lock().unwrap().clone().unwrap();
@@ -637,11 +942,94 @@ mod e2e_tests {
             Some("authorization_code")
         );
         assert_eq!(form.get("code").map(String::as_str), Some("auth-code-1"));
-        assert_eq!(form.get("redirect_uri").unwrap(), &listener::redirect_uri());
+        assert_eq!(form.get("redirect_uri").unwrap(), &redirect_uri);
         assert_eq!(form.get("code_verifier").unwrap(), &verifier);
         assert_eq!(
             form.get("client_id").map(String::as_str),
-            Some("demo-client")
+            Some("client-123")
         );
+        // 5. The id_token was bound to this flow (nonce) and issued for this
+        //    client (aud) → no nonce/aud findings.
+        let recorded = store::findings();
+        let ids: Vec<&str> = recorded.iter().map(|f| f.id.as_str()).collect();
+        assert!(!ids.contains(&"nonce_mismatch"), "{ids:?}");
+        assert!(!ids.contains(&"missing_nonce"), "{ids:?}");
+        assert!(!ids.contains(&"aud_mismatch"), "{ids:?}");
+        assert!(!ids.contains(&"alg_mismatch"), "{ids:?}");
+    }
+
+    /// Client Credentials grant end to end: the README marks it ✅, so this
+    /// test is what keeps that claim honest.
+    #[tokio::test]
+    async fn client_credentials_grant_works() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+
+        let seen: Arc<Mutex<Vec<HashMap<String, String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_route = seen.clone();
+        let token_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_port = token_listener.local_addr().unwrap().port();
+        let token_router = axum::Router::new().route(
+            "/token",
+            axum::routing::post(
+                move |axum::extract::Form(form): axum::extract::Form<HashMap<String, String>>| {
+                    let seen = seen_route.clone();
+                    async move {
+                        seen.lock().unwrap().push(form);
+                        axum::Json(json!({
+                            "access_token": "cc-access-token",
+                            "token_type": "Bearer",
+                            "expires_in": 1800,
+                            "scope": "read write",
+                        }))
+                    }
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            axum::serve(token_listener, token_router).await.unwrap();
+        });
+
+        let config = FlowConfig {
+            flow_type: FlowType::ClientCredentials,
+            authorization_endpoint: String::new(),
+            token_endpoint: format!("http://127.0.0.1:{token_port}/token"),
+            client_id: "service-client".into(),
+            client_secret: "shh".into(),
+            redirect_uri: String::new(),
+            scope: "read".into(),
+            pkce: false,
+            include_nonce: false,
+            client_auth: ClientAuth::ClientSecretPost,
+            listener_port: 0,
+            expected_iss: String::new(),
+            expected_alg: String::new(),
+            jwks_uri: String::new(),
+            device_authorization_endpoint: String::new(),
+        };
+
+        let bundle = token_exchange::client_credentials(&handle, &config)
+            .await
+            .expect("client credentials grant should succeed");
+        assert_eq!(bundle.access_token.as_deref(), Some("cc-access-token"));
+        assert!(bundle.expires_at.is_some());
+
+        let recorded = seen.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        let form = &recorded[0];
+        assert_eq!(
+            form.get("grant_type").map(String::as_str),
+            Some("client_credentials")
+        );
+        assert_eq!(
+            form.get("client_id").map(String::as_str),
+            Some("service-client")
+        );
+        assert_eq!(form.get("client_secret").map(String::as_str), Some("shh"));
+        assert_eq!(form.get("scope").map(String::as_str), Some("read"));
+        // No browser flow means no redirect_uri / code / verifier.
+        assert!(!form.contains_key("redirect_uri"));
+        assert!(!form.contains_key("code"));
+        assert!(!form.contains_key("code_verifier"));
     }
 }

@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "Default capability for all app windows (core events + invoke)",
-  "windows": ["*"],
+  "description": "Capabilities for the app's own window only. Deliberately scoped to `main`: the `oauth-auth` window loads the provider's remote login page, and remote origins are never granted IPC access (Tauri v2 denies remote invoke unless a capability lists `remote.urls`, which this app never does).",
+  "windows": ["main"],
   "permissions": ["core:default"]
 }

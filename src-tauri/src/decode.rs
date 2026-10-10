@@ -1,8 +1,8 @@
 //! JWT decoding: splits a token into header/payload/signature, base64url-decodes
 //! the first two segments, and surfaces warnings about suspicious algorithms.
 //!
-//! Signature verification (JWKS fetch) is intentionally *not* done here — it is
-//! on the roadmap. This module is decode-only.
+//! Signature verification (JWKS fetch) is intentionally *not* done here — see
+//! [`crate::jwks`]. This module is decode-only.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -21,7 +21,7 @@ pub struct DecodedJwt {
     pub warnings: Vec<String>,
 }
 
-fn b64url_decode(part: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn b64url_decode(part: &str) -> Result<Vec<u8>, String> {
     // JWT uses unpadded base64url; strip any padding some producers add.
     let cleaned: String = part.chars().filter(|c| *c != '=').collect();
     URL_SAFE_NO_PAD
@@ -88,9 +88,9 @@ fn analyze(
     let mut warnings = Vec::new();
 
     match alg {
-        "none" | "" => warnings.push(
-            "alg is \"none\" — the token is unsigned and anyone can forge it".into(),
-        ),
+        "none" | "" => {
+            warnings.push("alg is \"none\" — the token is unsigned and anyone can forge it".into())
+        }
         a if a.starts_with("HS") => warnings.push(format!(
             "{a} — HMAC signed. If the provider signs with your client secret, a leaked \
              secret lets attackers mint tokens; RS/ES is preferred"

@@ -13,6 +13,7 @@ const FLOW_OPTIONS: { value: FlowType; label: string }[] = [
   { value: "authorization_code", label: "Authorization Code" },
   { value: "implicit", label: "Implicit (legacy)" },
   { value: "client_credentials", label: "Client Credentials" },
+  { value: "device_authorization", label: "Device Authorization" },
 ];
 
 function Label({ children }: { children: React.ReactNode }) {
@@ -85,10 +86,16 @@ export default function FlowConfig({ config, onChange, onStart, onReset, busy, r
   const isCode = config.flow_type === "authorization_code";
   const isImplicit = config.flow_type === "implicit";
   const isCc = config.flow_type === "client_credentials";
+  const isDevice = config.flow_type === "device_authorization";
 
   const canStart = isCc
     ? config.token_endpoint.trim() !== "" && config.client_id.trim() !== ""
-    : config.authorization_endpoint.trim() !== "" && config.client_id.trim() !== "";
+    : isDevice
+      ? config.device_authorization_endpoint.trim() !== "" &&
+        config.token_endpoint.trim() !== "" &&
+        config.client_id.trim() !== ""
+      : config.authorization_endpoint.trim() !== "" &&
+        config.client_id.trim() !== "";
 
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto scroll-thin">
@@ -113,7 +120,7 @@ export default function FlowConfig({ config, onChange, onStart, onReset, busy, r
             </Select>
           </div>
 
-          {!isCc && (
+          {!isCc && !isDevice && (
             <div>
               <Label>Authorization endpoint</Label>
               <Input
@@ -124,6 +131,25 @@ export default function FlowConfig({ config, onChange, onStart, onReset, busy, r
                 disabled={busy}
                 spellCheck={false}
               />
+            </div>
+          )}
+
+          {isDevice && (
+            <div>
+              <Label>Device authorization endpoint</Label>
+              <Input
+                autoFocus
+                value={config.device_authorization_endpoint}
+                onChange={(e) =>
+                  set("device_authorization_endpoint", e.target.value)
+                }
+                placeholder="https://provider.example/device"
+                disabled={busy}
+                spellCheck={false}
+              />
+              <p className="mt-1 text-[11px] leading-snug text-zinc-500">
+                RFC 8628 endpoint that issues the device + user code.
+              </p>
             </div>
           )}
 
@@ -165,7 +191,7 @@ export default function FlowConfig({ config, onChange, onStart, onReset, busy, r
             </div>
           )}
 
-          {!isCc && (
+          {!isCc && !isDevice && (
             <div>
               <Label>Redirect URI</Label>
               <Input
@@ -176,8 +202,27 @@ export default function FlowConfig({ config, onChange, onStart, onReset, busy, r
                 spellCheck={false}
               />
               <p className="mt-1 text-[11px] leading-snug text-zinc-500">
-                Register this exact URI with your provider. The built-in listener captures it on
-                port 9004.
+                Register this exact URI with your provider. The built-in loopback listener
+                intercepts the redirect.
+              </p>
+            </div>
+          )}
+
+          {!isCc && !isDevice && (
+            <div>
+              <Label>Listener port</Label>
+              <Input
+                type="number"
+                min={1}
+                max={65535}
+                value={config.listener_port}
+                onChange={(e) => set("listener_port", Number(e.target.value) || 0)}
+                disabled={busy || config.redirect_uri.trim() !== ""}
+              />
+              <p className="mt-1 text-[11px] leading-snug text-zinc-500">
+                {config.redirect_uri.trim()
+                  ? "Pinned by the redirect URI above."
+                  : "Loopback only (127.0.0.1). If the port is busy, a free one is picked and the redirect URI follows it."}
               </p>
             </div>
           )}
@@ -210,12 +255,14 @@ export default function FlowConfig({ config, onChange, onStart, onReset, busy, r
           <Toggle
             checked={config.include_nonce}
             onChange={(v) => set("include_nonce", v)}
-            disabled={isCc || busy}
+            disabled={isCc || isDevice || busy}
             label="OIDC nonce"
             hint={
-              isImplicit
-                ? "Adds nonce and requests an id_token (response_type=id_token token)"
-                : "Checked against the ID token's nonce claim"
+              isDevice
+                ? "Not applicable — the device flow has no authorization request"
+                : isImplicit
+                  ? "Adds nonce and requests an id_token (response_type=id_token token)"
+                  : "Checked against the ID token's nonce claim"
             }
           />
           {!isImplicit && (
@@ -232,6 +279,50 @@ export default function FlowConfig({ config, onChange, onStart, onReset, busy, r
               </Select>
             </div>
           )}
+
+          <div className="border-t border-zinc-800 pt-3">
+            <Label>Expected issuer (optional)</Label>
+            <Input
+              value={config.expected_iss}
+              onChange={(e) => set("expected_iss", e.target.value)}
+              placeholder="https://accounts.example.com"
+              disabled={busy}
+              spellCheck={false}
+            />
+            <p className="mt-1 text-[11px] leading-snug text-zinc-500">
+              Flags an <code className="text-zinc-400">iss</code> claim that doesn&apos;t match.
+            </p>
+          </div>
+
+          <div>
+            <Label>Expected JWT alg (optional)</Label>
+            <Input
+              value={config.expected_alg}
+              onChange={(e) => set("expected_alg", e.target.value)}
+              placeholder="RS256"
+              disabled={busy}
+              spellCheck={false}
+            />
+            <p className="mt-1 text-[11px] leading-snug text-zinc-500">
+              Flags <code className="text-zinc-400">alg: none</code> and HS256 where RS256 (or
+              whatever you set) is expected.
+            </p>
+          </div>
+
+          <div className="border-t border-zinc-800 pt-3">
+            <Label>JWKS URI (optional)</Label>
+            <Input
+              value={config.jwks_uri}
+              onChange={(e) => set("jwks_uri", e.target.value)}
+              placeholder="https://provider.example/.well-known/jwks.json"
+              disabled={busy}
+              spellCheck={false}
+            />
+            <p className="mt-1 text-[11px] leading-snug text-zinc-500">
+              Enables signature verification (RS256/ES256). Leave empty to discover it
+              from the expected issuer or the token&apos;s <code className="text-zinc-400">iss</code>.
+            </p>
+          </div>
         </div>
       </section>
 
@@ -246,7 +337,17 @@ export default function FlowConfig({ config, onChange, onStart, onReset, busy, r
             disabled={!canStart || busy}
             className="flex-1 rounded-md bg-emerald-600 px-3 py-2 text-sm font-semibold text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-500"
           >
-            {busy ? "Working…" : isCc ? "Get Token" : running ? "Flow running…" : "Start Flow"}
+            {busy
+              ? "Working…"
+              : isCc
+                ? "Get Token"
+                : isDevice
+                  ? running
+                    ? "Polling…"
+                    : "Start Device Flow"
+                  : running
+                    ? "Flow running…"
+                    : "Start Flow"}
           </button>
           <button
             type="button"
@@ -260,7 +361,9 @@ export default function FlowConfig({ config, onChange, onStart, onReset, busy, r
         <p className="mt-2 text-[11px] leading-snug text-zinc-500">
           {isCc
             ? "No browser needed — the client credentials grant posts straight to the token endpoint."
-            : "A controlled webview opens at the provider; the redirect is intercepted locally before it reaches the network stack."}
+            : isDevice
+              ? "Requests a device code, shows the user_code, then polls the token endpoint until you authorize it at the verification URI."
+              : "A controlled webview opens at the provider; the redirect is intercepted locally before it reaches the network stack."}
         </p>
       </section>
     </div>
