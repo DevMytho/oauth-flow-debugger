@@ -60,6 +60,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
+          components: rustfmt, clippy
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
@@ -72,6 +73,14 @@ jobs:
 
       - name: Typecheck frontend
         run: npm run typecheck
+
+      - name: Rustfmt
+        shell: bash
+        run: cargo fmt --all --check --manifest-path src-tauri/Cargo.toml
+
+      - name: Clippy (deny warnings)
+        shell: bash
+        run: cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
 
       - name: Run backend tests
         shell: bash

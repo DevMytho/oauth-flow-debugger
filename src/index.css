@@ -38,7 +38,17 @@ code,
     "Liberation Mono", monospace;
 }
 
-/* Thin scrollbars for panels */
+/* The config column must scroll inside its grid cell. Without pinning the
+   row height, the auto row grows to the content and the Start Flow button
+   falls outside the window on short displays. */
+main {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+aside {
+  overflow-y: auto;
+}
+
 .scroll-thin {
   scrollbar-width: thin;
   scrollbar-color: #3f3f46 transparent;

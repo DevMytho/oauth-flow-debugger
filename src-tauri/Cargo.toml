@@ -19,6 +19,8 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 url = "2"
+rsa = { version = "0.9.10", features = ["sha2"] }
+p256 = { version = "0.14.0", features = ["ecdsa"] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

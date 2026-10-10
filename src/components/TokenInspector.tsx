@@ -60,6 +60,8 @@ export default function TokenInspector({ bundle, flowNonce }: Props) {
   const token = active === "id" ? bundle?.id_token : bundle?.access_token;
   const jwt: DecodedJwt | null =
     active === "id" ? bundle?.decoded_id ?? null : bundle?.decoded_access ?? null;
+  const verification =
+    active === "id" ? bundle?.verification?.id ?? null : bundle?.verification?.access ?? null;
 
   const visibleClaims = useMemo(() => {
     if (!jwt) return [];
@@ -222,10 +224,29 @@ export default function TokenInspector({ bundle, flowNonce }: Props) {
             <div className="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">
               Signature
             </div>
-            <div className="mt-1 text-[12px] text-zinc-400">
-              Verification: ⏳ not verified — decode only. JWKS endpoint fetcher + offline key
-              verification is on the roadmap.
-            </div>
+            {verification && verification.status === "valid" && (
+              <div className="mt-1 text-[12px] text-emerald-400">
+                ✅ valid ({verification.alg}
+                {verification.kid ? `, kid ${verification.kid}` : ""}) — signature
+                verified against {verification.jwks_uri}
+              </div>
+            )}
+            {verification && verification.status === "invalid" && (
+              <div className="mt-1 text-[12px] text-rose-400">
+                ❌ INVALID ({verification.alg}) — {verification.detail}
+              </div>
+            )}
+            {verification && verification.status === "unverified" && (
+              <div className="mt-1 text-[12px] text-amber-400">
+                ⏳ not verified ({verification.alg}) — {verification.detail}
+              </div>
+            )}
+            {!verification && (
+              <div className="mt-1 text-[12px] text-zinc-400">
+                ⏳ not verified — no signature check ran for this token (it is not a JWT, or
+                no tokens were received yet).
+              </div>
+            )}
             {jwt.warnings.length > 0 && (
               <ul className="mt-2 space-y-1 text-[12px] text-amber-400">
                 {jwt.warnings.map((w, i) => (

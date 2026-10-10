@@ -1,0 +1,56 @@
+name: CI
+
+# Every push / PR: formatting, lints, backend tests and frontend typecheck.
+# Release builds (installers) happen in release.yml when a `v*` tag is pushed.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: fmt · clippy · test · typecheck
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust stable (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Typecheck frontend
+        run: npm run typecheck
+
+      - name: Rustfmt
+        run: cargo fmt --all --check --manifest-path src-tauri/Cargo.toml
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Backend tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
